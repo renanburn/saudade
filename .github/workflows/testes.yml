@@ -1,0 +1,32 @@
+name: testes
+on:
+  push:
+  pull_request:
+jobs:
+  semantica:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Semântica (as 5 cenas + round-trip)
+        run: python3 testes/semantica.py
+      - name: Servidor MCP (handshake + ciclo real)
+        run: python3 testes/mcp.py
+      - name: "Detector vs dataset (gate de recall 0.80)"
+        run: python3 testes/avaliar.py
+      - name: Smoke do CLI num banco limpo
+        run: |
+          set -euo pipefail
+          export SAUDADE_DB="$RUNNER_TEMP/m.db"
+          python3 bin/saudade init
+          python3 bin/saudade add "CI" observacao "rodou no Actions"
+          python3 bin/saudade estado | grep -q "Estado vivo"
+          python3 bin/saudade lint decisao "um fato só, limpo" | grep -q limpo
+      - name: Python 3.8 (compatibilidade mínima declarada)
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.8"
+      - name: Semântica no 3.8
+        run: python3 testes/semantica.py

@@ -1,0 +1,851 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""saudade — memória que sabe o que morreu.
+
+Log append-only de fatos + invalidação bi-temporal + estado derivado por evento.
+Python 3.8+, stdlib apenas, um arquivo. O banco é SQLite puro.
+
+As três regras que este arquivo serve (e que valem até sem ele, só com papel):
+  1. Um fato por linha, com data.
+  2. Nunca apague. Marque o que morreu, dizendo por quê.
+  3. O que a IA lê todo dia é uma projeção do log, não o log.
+
+Comandos:
+    saudade init
+    saudade add "Entity" tipo "texto"
+    saudade add "Entity" supersede "#12 · motivo"     # o fato 12 deixou de ser verdade
+    saudade add "Entity" resolvido "#12 · nota"       # a pendência 12 foi cumprida
+    saudade buscar "termo" [--vigente] [--tipo t] [--entity e]
+    saudade estado                                     # a projeção: o que vale AGORA
+    saudade rel add "A" "B" "depende de"
+    saudade rel invalidate 7 --reason "..."
+    saudade rel list [--entity e] [--todas] · saudade rel audit
+    saudade contradicoes [--juiz sonnet|off]           # propõe supersedes; nunca aplica
+    saudade compactar [--apply]                        # aditivo; nunca apaga
+    saudade lint "texto"                               # higiene antes de gravar
+
+Banco: $SAUDADE_DB (padrão ~/.saudade/memoria.db).
+"""
+import argparse
+import difflib
+import os
+import re
+import shutil
+import sqlite3
+import subprocess
+import sys
+import unicodedata
+from collections import Counter
+from datetime import date, datetime, timedelta
+
+DB = os.environ.get("SAUDADE_DB", os.path.expanduser("~/.saudade/memoria.db"))
+
+# ---------------------------------------------------------------- vocabulário
+
+TIPOS = {
+    "decisao", "pendencia", "bloqueio", "experimento", "mudanca", "observacao",
+    "feedback", "resolvido", "supersede", "sintese",
+}
+# eventos que agem sobre uma observation anterior, via "#id" no INÍCIO do texto
+TIPOS_ALVO = {"resolvido", "supersede"}
+# tipos que AFIRMAM estado (podem deixar de ser verdade)
+TIPOS_ESTADO = {"decisao", "mudanca", "observacao", "bloqueio", "pendencia", "experimento"}
+# pendências que ganham baixa via `resolvido`
+TIPOS_COM_BAIXA = {"pendencia", "bloqueio"}
+
+# vocabulário controlado de arestas. Tipo fora daqui exige --force.
+VOCAB_REL = {
+    "pertence a":    "pertencimento / é parte de",
+    "depende de":    "dependência técnica ou de precedência",
+    "bloqueado por": "não avança até o outro resolver",
+    "deriva de":     "origem, sucessão, recorte de",
+    "alimenta":      "manda dado ou insumo pra",
+    "consome":       "usa dado ou serviço de",
+    "implementa":    "realiza, materializa",
+    "documenta":     "descreve, registra",
+    "opera":         "controla, hospeda, executa, monitora",
+    "usa":           "usa como ferramenta",
+    "atende":        "serve pessoa, cliente ou necessidade",
+}
+
+# Marcas de reversão pro detector de contradição. SEMPRE em ASCII: o texto é
+# desacentuado antes de casar (marca com acento é código morto — bug real).
+# FORTE = afirma que algo deixou de valer. FRACA = cheiro de correção.
+# "corrigido"/"reescrito" ficam de fora de propósito: em log de trabalho é
+# rotina ("bug corrigido"), não reversão de fato.
+# A lista nasceu estreita (só o vocabulário do banco do autor) e o dataset provou:
+# recall 0,23 na primeira rodada. Reversão no mundo real fala "recuou", "cancelou",
+# "trocou", "rescindiu", "estornou". Radicais cobrem conjugação (cancelou/cancelada).
+MARCAS_FORTES = [
+    "revert", "decidiu ficar", "mudou de ideia", "voltou atras", "desistiu",
+    "cancel", "desmarcou", "recuou", "remarcad", "remarcou", "adiou", "adiad",
+    "rescindiu", "rescis", "estorn", "abortou", "suspendeu", "rompeu", "desfez",
+    "invalidad", "estava errad", "equivocad", "nao procede", "nunca foi",
+    "deixou de ser", "deixou de valer", "nao e mais", "nao vai mais",
+    "nao aprovou", "nao fechou", "nao rolou", "ao contrario",
+    "caiu a premissa", "premissa caiu", "caiu", "travou", "substituid",
+    "trocou", "saiu do", "saiu da", "nao acontece", "nao sera mais",
+]
+# fracas: cheiro de mudança; só viram par com sobreposição real de assunto.
+# "agora" cobre o padrão "antes X, agora Y" (troca de preço, de pessoa, de plano).
+MARCAS_FRACAS = ["correcao", "premissa", "na verdade", "ressalva", "agora", "na real", "afinal"]
+
+OBS_RE = re.compile(
+    r"^\[(?P<ts>\d{4}-\d{2}-\d{2} \d{2}:\d{2})\]\s+(?P<tipo>[a-zA-Z_-]+)\s*::\s*(?P<texto>.+)$",
+    re.DOTALL,
+)
+# só a sequência LÍDER de #id conta como alvo (menção no meio não é baixa)
+HEAD_RE = re.compile(r"^((?:#\d+[\s,]*)+)")
+
+SCHEMA = None  # carregado de esquema/schema.sql ou do fallback embutido
+
+SCHEMA_EMBUTIDO = """
+CREATE TABLE IF NOT EXISTS entities (
+    name TEXT PRIMARY KEY, entity_type TEXT NOT NULL DEFAULT 'tema',
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP);
+CREATE TABLE IF NOT EXISTS observations (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    entity_name TEXT NOT NULL REFERENCES entities(name),
+    content TEXT NOT NULL, created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    tipo TEXT, ts TEXT, supersedes_id INTEGER, cold INTEGER NOT NULL DEFAULT 0);
+CREATE TABLE IF NOT EXISTS relations (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    source TEXT NOT NULL REFERENCES entities(name),
+    target TEXT NOT NULL REFERENCES entities(name),
+    relation_type TEXT NOT NULL, created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    valid_from TEXT, invalidated_at TEXT, invalid_reason TEXT, invalidated_by TEXT);
+CREATE INDEX IF NOT EXISTS idx_obs_entity ON observations(entity_name);
+CREATE INDEX IF NOT EXISTS idx_obs_tipo ON observations(tipo);
+CREATE INDEX IF NOT EXISTS idx_obs_ts ON observations(ts);
+CREATE INDEX IF NOT EXISTS idx_obs_supersedes ON observations(supersedes_id);
+CREATE INDEX IF NOT EXISTS idx_obs_cold ON observations(cold);
+CREATE INDEX IF NOT EXISTS idx_rel_source ON relations(source);
+CREATE INDEX IF NOT EXISTS idx_rel_target ON relations(target);
+CREATE INDEX IF NOT EXISTS idx_rel_inval ON relations(invalidated_at);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_ent_canon ON entities(lower(name));
+CREATE UNIQUE INDEX IF NOT EXISTS idx_rel_ativa
+    ON relations(source, target, relation_type) WHERE invalidated_at IS NULL;
+"""
+
+# ------------------------------------------------------------------ cosmética
+
+_TTY = sys.stdout.isatty()
+
+
+def _c(code):
+    return code if _TTY else ""
+
+
+BOLD, DIM, RED, GRN, YEL, RST = (_c("\033[1m"), _c("\033[2m"), _c("\033[31m"),
+                                 _c("\033[32m"), _c("\033[33m"), _c("\033[0m"))
+
+# ------------------------------------------------------------- funções puras
+
+
+def desacentua(s):
+    return "".join(c for c in unicodedata.normalize("NFKD", s) if not unicodedata.combining(c))
+
+
+def canon_nome(nome):
+    """Chave de canonicalização de entity: minúsculo, sem acento, sem prefixo
+    numérico 'NN - ', sem pontuação. Pega variações tipo 'Catálogo' vs 'catalogo'."""
+    s = desacentua(nome).lower()
+    s = re.sub(r"^\s*\d+\s*[-–—]\s*", "", s)
+    return re.sub(r"[^a-z0-9]+", " ", s).strip()
+
+
+def parse_content(content):
+    """content -> (ts, tipo, texto). Fora do formato: tipo=observacao, ts=None."""
+    m = OBS_RE.match((content or "").strip())
+    if not m:
+        return None, "observacao", (content or "").strip()
+    return m.group("ts"), m.group("tipo"), m.group("texto")
+
+
+def leading_ids(texto):
+    """Ids da sequência LÍDER de #id. Menção no meio do texto não conta."""
+    m = HEAD_RE.match((texto or "").strip())
+    if not m:
+        return []
+    return [int(x) for x in re.findall(r"#(\d+)", m.group(1))]
+
+
+def superseded_ids(fatos):
+    """Ids mortos por evento `supersede`. fatos: iterável de dicts com tipo/texto."""
+    out = set()
+    for f in fatos:
+        if f["tipo"] == "supersede":
+            out.update(leading_ids(f["texto"]))
+    return out
+
+
+def resolved_ids(fatos, ja_superseded=None):
+    """Ids com baixa via `resolvido`. A ordem importa: um `resolvido` que foi ele
+    mesmo superado NÃO dá baixa (a baixa estava errada, a pendência reabre)."""
+    mortos = ja_superseded if ja_superseded is not None else superseded_ids(fatos)
+    out = set()
+    for f in fatos:
+        if f["tipo"] == "resolvido" and f["id"] not in mortos:
+            out.update(leading_ids(f["texto"]))
+    return out
+
+
+def forca_marca(texto):
+    """2 = afirma reversão · 1 = cheiro de correção · 0 = nada."""
+    t = desacentua((texto or "").lower())
+    if any(m in t for m in MARCAS_FORTES):
+        return 2
+    if any(m in t for m in MARCAS_FRACAS):
+        return 1
+    return 0
+
+
+def lint_texto(tipo, texto):
+    """Higiene do fato ANTES de entrar. Retorna (erros, avisos).
+
+    A regra mais importante é a de dois fatos: uma observation que empilha fato
+    vivo + fato morto não pode ser superada depois sem matar o vivo junto.
+    Heurística, não juiz: na dúvida ela avisa, não bloqueia."""
+    erros, avisos = [], []
+    if tipo not in TIPOS:
+        erros.append(f"tipo inválido: {tipo!r}. Válidos: {', '.join(sorted(TIPOS))}")
+        return erros, avisos
+    ids = leading_ids(texto)
+    if tipo in TIPOS_ALVO and not ids:
+        erros.append(f"'{tipo}' exige o #id do alvo no INÍCIO do texto. Ex: \"#12 · motivo\"")
+    if tipo not in TIPOS_ALVO and ids:
+        avisos.append("texto começa com #id mas o tipo não é resolvido/supersede; isso NÃO dá baixa em nada")
+    if tipo not in TIPOS_ALVO and re.search(r"#\d+", texto or ""):
+        if not ids:
+            avisos.append("menção a #id no meio do texto não conta como baixa (regra da sequência líder)")
+    # dois fatos numa linha: conector forte entre orações com verbo dos dois lados
+    t = (texto or "").strip()
+    if tipo in TIPOS_ESTADO:
+        conectores = re.split(r";\s+|\.\s+(?=[A-ZÀ-Ú])", t)
+        if len(conectores) >= 3:
+            avisos.append("parece empilhar 3+ fatos numa linha; um fato por linha permite superar cada um sozinho")
+        elif len(conectores) == 2 and re.search(r"\b(decidiu|vai|resolveu|definiu|combinou)\b", conectores[1] or "", re.I):
+            avisos.append("parece haver DOIS fatos aqui (estado + decisão); separe em duas linhas")
+        if len(t) > 400:
+            avisos.append(f"fato com {len(t)} caracteres; quanto mais longo, mais difícil de superar cirurgicamente")
+    return erros, avisos
+
+
+# ------------------------------------------------------------------- banco
+
+
+def conectar(db, ro=False):
+    if ro:
+        return sqlite3.connect(f"file:{db}?mode=ro", uri=True, timeout=15)
+    return sqlite3.connect(db, timeout=15)
+
+
+def exige_db(db):
+    if not os.path.exists(db):
+        print(f"banco não existe: {db}\nrode: saudade init", file=sys.stderr)
+        sys.exit(1)
+
+
+def carrega_fatos(db, incluir_frios=False):
+    con = conectar(db, ro=True)
+    con.row_factory = sqlite3.Row
+    try:
+        where = "" if incluir_frios else "WHERE cold = 0"
+        rows = con.execute(f"SELECT id, entity_name, content FROM observations {where} ORDER BY id").fetchall()
+    finally:
+        con.close()
+    fatos = []
+    for r in rows:
+        ts, tipo, texto = parse_content(r["content"])
+        fatos.append({"id": r["id"], "entity": r["entity_name"], "tipo": tipo,
+                      "ts": ts or "", "texto": texto})
+    return fatos
+
+
+def agora():
+    return datetime.now().strftime("%Y-%m-%d %H:%M")
+
+
+# ---------------------------------------------------------------- comandos
+
+
+def cmd_init(a):
+    os.makedirs(os.path.dirname(a.db) or ".", exist_ok=True)
+    con = conectar(a.db)
+    try:
+        schema = SCHEMA_EMBUTIDO
+        aqui = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        candidato = os.path.join(aqui, "esquema", "schema.sql")
+        if os.path.exists(candidato):
+            with open(candidato) as f:
+                schema = f.read()
+        con.executescript(schema)
+        con.commit()
+        n = con.execute("SELECT COUNT(*) FROM observations").fetchone()[0]
+    finally:
+        con.close()
+    print(f"{GRN}ok{RST}: banco pronto em {a.db} ({n} observations)")
+    print(f'{DIM}primeiro fato: saudade add "Meu Projeto" observacao "começou hoje"{RST}')
+
+
+def cmd_add(a):
+    exige_db(a.db)
+    erros, avisos = lint_texto(a.tipo, a.texto)
+    for e in erros:
+        print(f"{RED}erro{RST}: {e}", file=sys.stderr)
+    if erros:
+        sys.exit(2)
+    alvos = leading_ids(a.texto) if a.tipo in TIPOS_ALVO else []
+
+    stamp = a.at or agora()
+    content = f"[{stamp}] {a.tipo} :: {a.texto}"
+
+    con = conectar(a.db)
+    try:
+        cur = con.cursor()
+        # alvo tem que existir (baixa fantasma não entra)
+        for aid in alvos:
+            row = cur.execute("SELECT tipo FROM observations WHERE id=?", (aid,)).fetchone()
+            if row is None:
+                print(f"{RED}erro{RST}: observation #{aid} não existe. Nada gravado.", file=sys.stderr)
+                sys.exit(3)
+            if a.tipo == "resolvido" and row[0] not in TIPOS_COM_BAIXA:
+                avisos.append(f"#{aid} é '{row[0]}', não pendência/bloqueio. Pra matar um FATO use 'supersede'")
+
+        # entity: cria se faltar, trava variação canônica
+        row = cur.execute("SELECT name FROM entities WHERE name=?", (a.entity,)).fetchone()
+        criada = False
+        if row is None:
+            alvo = canon_nome(a.entity)
+            colisao = [n for (n,) in cur.execute("SELECT name FROM entities") if canon_nome(n) == alvo]
+            if colisao and not a.force:
+                print(f"{RED}erro{RST}: '{a.entity}' parece variação de {colisao!r}. "
+                      f"Reuse a existente ou passe --force.", file=sys.stderr)
+                sys.exit(4)
+            cur.execute("INSERT INTO entities (name, entity_type) VALUES (?,?)", (a.entity, a.etype))
+            criada = True
+
+        cur.execute(
+            "INSERT INTO observations (entity_name, content, tipo, ts, supersedes_id) VALUES (?,?,?,?,?)",
+            (a.entity, content, a.tipo, stamp, alvos[0] if alvos else None),
+        )
+        oid = cur.lastrowid
+        con.commit()
+        try:
+            cur.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        except sqlite3.Error:
+            pass
+    finally:
+        con.close()
+
+    tag = " (entity criada)" if criada else ""
+    print(f"{GRN}+{RST} #{oid}{tag}  {content}")
+    if alvos:
+        verbo = "dá baixa em" if a.tipo == "resolvido" else "supera"
+        print(f"  ↳ {verbo} {', '.join('#' + str(i) for i in alvos)}")
+    for w in avisos:
+        print(f"{YEL}aviso{RST}: {w}", file=sys.stderr)
+
+
+def cmd_lint(a):
+    erros, avisos = lint_texto(a.tipo, a.texto)
+    for e in erros:
+        print(f"{RED}erro{RST}: {e}")
+    for w in avisos:
+        print(f"{YEL}aviso{RST}: {w}")
+    if not erros and not avisos:
+        print(f"{GRN}limpo{RST}: um fato, tipado, superável.")
+    sys.exit(2 if erros else 0)
+
+
+def _fts_query(term):
+    partes = [p for p in re.findall(r"\w+", term) if p]
+    return " ".join(f'"{p}"' for p in partes) if partes else '""'
+
+
+def cmd_buscar(a):
+    exige_db(a.db)
+    fatos = carrega_fatos(a.db, incluir_frios=a.incluir_frios)
+    mortos = superseded_ids(fatos)
+    baixas = resolved_ids(fatos, mortos)
+    # quem matou quem (pro "morto por #x: motivo")
+    causa = {}
+    for f in fatos:
+        if f["tipo"] in TIPOS_ALVO:
+            for aid in leading_ids(f["texto"]):
+                causa[aid] = f
+
+    idx = sqlite3.connect(":memory:")
+    idx.execute("CREATE VIRTUAL TABLE obs USING fts5(entity, tipo, ts, texto, oid UNINDEXED)")
+    idx.executemany(
+        "INSERT INTO obs (entity, tipo, ts, texto, oid) VALUES (?,?,?,?,?)",
+        [(f["entity"], f["tipo"], f["ts"], f["texto"], f["id"]) for f in fatos],
+    )
+    sql = "SELECT oid, entity, tipo, ts, texto, bm25(obs) FROM obs WHERE obs MATCH ?"
+    par = [_fts_query(a.termo)]
+    if a.tipo:
+        sql += " AND tipo = ?"
+        par.append(a.tipo)
+    if a.entity:
+        sql += " AND entity = ?"
+        par.append(a.entity)
+    sql += " ORDER BY bm25(obs) LIMIT ?"
+    par.append(a.limit * 3)
+    rows = idx.execute(sql, par).fetchall()
+    idx.close()
+
+    mostrados = 0
+    for oid, entity, tipo, ts, texto, _rank in rows:
+        morto = oid in mortos
+        baixado = oid in baixas
+        if a.vigente and (morto or (tipo in TIPOS_COM_BAIXA and baixado)):
+            continue
+        if mostrados >= a.limit:
+            break
+        mostrados += 1
+        marca = f"  {RED}⊘ SUPERADO{RST}" if morto else (f"  {GRN}✓ resolvido{RST}" if baixado and tipo in TIPOS_COM_BAIXA else "")
+        print(f"{BOLD}#{oid}{RST}  {entity}  {DIM}{tipo}  {ts}{RST}{marca}")
+        print(f"  {texto[:280]}")
+        ev = causa.get(oid)
+        if morto and ev:
+            print(f"  {RED}⊘ morto por #{ev['id']}{RST}: {DIM}{ev['texto'][:160]}{RST}")
+        elif baixado and tipo in TIPOS_COM_BAIXA and ev:
+            print(f"  {GRN}✓ baixa por #{ev['id']}{RST}: {DIM}{ev['texto'][:160]}{RST}")
+        print()
+    if not mostrados:
+        print("nada encontrado.")
+
+
+def cmd_estado(a):
+    """A projeção: o que vale AGORA. É isto (e só isto) que se injeta na IA."""
+    exige_db(a.db)
+    fatos = carrega_fatos(a.db)
+    mortos = superseded_ids(fatos)
+    baixas = resolved_ids(fatos, mortos)
+    hoje = date.today()
+    d_pend = (hoje - timedelta(days=a.dias_pendencia)).isoformat()
+    d_dec = (hoje - timedelta(days=a.dias_decisao)).isoformat()
+
+    def vivos(tipo, desde):
+        return [f for f in fatos if f["tipo"] == tipo and f["ts"][:10] >= desde
+                and f["id"] not in mortos and f["id"] not in baixas]
+
+    print(f"# Estado vivo · {hoje.isoformat()}")
+    print(f"{DIM}derivado por evento; fato superado e pendência baixada não aparecem{RST}\n")
+    bl = vivos("bloqueio", d_pend)
+    if bl:
+        print(f"## Bloqueios ({a.dias_pendencia}d)")
+        for f in bl[-8:]:
+            print(f"- #{f['id']} [{f['ts'][:10]}] {f['entity']}: {f['texto'][:160]}")
+        print()
+    pe = vivos("pendencia", d_pend)
+    if pe:
+        print(f"## Pendências ({a.dias_pendencia}d)")
+        for f in pe[-12:]:
+            print(f"- #{f['id']} [{f['ts'][:10]}] {f['entity']}: {f['texto'][:160]}")
+        print()
+    dec = [f for f in fatos if f["tipo"] in ("decisao", "mudanca") and f["ts"][:10] >= d_dec
+           and f["id"] not in mortos]
+    if dec:
+        print(f"## Decisões e mudanças ({a.dias_decisao}d)")
+        for f in dec[-10:]:
+            print(f"- #{f['id']} [{f['ts'][:10]}] {f['entity']}: {f['texto'][:160]}")
+        print()
+    ativas = Counter(f["entity"] for f in fatos if f["ts"][:10] >= d_dec)
+    if ativas:
+        top = " · ".join(f"{e} ({n})" for e, n in ativas.most_common(5))
+        print(f"{DIM}entities ativas ({a.dias_decisao}d): {top}{RST}")
+
+
+# ------------------------------------------------------------------ relations
+
+
+def _resolve_entity(cur, nome):
+    r = cur.execute("SELECT name FROM entities WHERE name=?", (nome,)).fetchone()
+    if r:
+        return r[0]
+    alvo = canon_nome(nome)
+    for (n,) in cur.execute("SELECT name FROM entities"):
+        if canon_nome(n) == alvo:
+            return n
+    return None
+
+
+def cmd_rel_add(a):
+    exige_db(a.db)
+    con = conectar(a.db)
+    try:
+        cur = con.cursor()
+        src, tgt = _resolve_entity(cur, a.source), _resolve_entity(cur, a.target)
+        for rotulo, dado, achado in (("source", a.source, src), ("target", a.target, tgt)):
+            if achado is None:
+                print(f"{RED}erro{RST}: entity {rotulo} não existe: {dado!r}", file=sys.stderr)
+                prox = difflib.get_close_matches(dado, [r[0] for r in cur.execute("SELECT name FROM entities")], n=3, cutoff=0.5)
+                if prox:
+                    print(f"  próximas: {prox}", file=sys.stderr)
+                sys.exit(3)
+        if src == tgt:
+            print(f"{RED}erro{RST}: relation de uma entity pra ela mesma não faz sentido.", file=sys.stderr)
+            sys.exit(2)
+        tipo = re.sub(r"\s+", " ", a.tipo.replace("_", " ")).strip()
+        if tipo not in VOCAB_REL and not a.force:
+            prox = difflib.get_close_matches(tipo, list(VOCAB_REL), n=2, cutoff=0.4)
+            print(f"{RED}erro{RST}: tipo fora do vocabulário: {tipo!r}", file=sys.stderr)
+            if prox:
+                print(f"  quis dizer: {prox}?", file=sys.stderr)
+            print(f"  vocabulário: {', '.join(sorted(VOCAB_REL))}\n  use --force se for mesmo um tipo novo.", file=sys.stderr)
+            sys.exit(4)
+        viva = cur.execute(
+            "SELECT id FROM relations WHERE source=? AND target=? AND relation_type=? AND invalidated_at IS NULL",
+            (src, tgt, tipo)).fetchone()
+        if viva:
+            print(f"relation já existe e está vigente: #{viva[0]}")
+            return
+        cur.execute("INSERT INTO relations (source,target,relation_type,valid_from) VALUES (?,?,?,?)",
+                    (src, tgt, tipo, agora()))
+        con.commit()
+        print(f"{GRN}+{RST} #{cur.lastrowid}  {src} -[{tipo}]-> {tgt}")
+    finally:
+        con.close()
+
+
+def cmd_rel_invalidate(a):
+    exige_db(a.db)
+    con = conectar(a.db)
+    try:
+        r = con.execute("SELECT source,target,relation_type,invalidated_at FROM relations WHERE id=?", (a.id,)).fetchone()
+        if not r:
+            print(f"{RED}erro{RST}: relation #{a.id} não existe.", file=sys.stderr)
+            sys.exit(3)
+        if r[3]:
+            print(f"relation #{a.id} já estava invalidada em {r[3]}.")
+            return
+        con.execute("UPDATE relations SET invalidated_at=?, invalid_reason=?, invalidated_by=? WHERE id=?",
+                    (agora(), a.reason, a.by, a.id))
+        con.commit()
+        print(f"{RED}⊘{RST} #{a.id}  {r[0]} -[{r[2]}]-> {r[1]}")
+        print(f"  invalidada: {a.reason}")
+        print(f"  {DIM}a linha continua no banco; nada foi apagado{RST}")
+    finally:
+        con.close()
+
+
+def cmd_rel_list(a):
+    exige_db(a.db)
+    con = conectar(a.db, ro=True)
+    try:
+        sql, par = "SELECT id,source,target,relation_type,invalidated_at,invalid_reason FROM relations WHERE 1=1", []
+        if not a.todas:
+            sql += " AND invalidated_at IS NULL"
+        if a.entity:
+            sql += " AND (source=? OR target=?)"
+            par += [a.entity, a.entity]
+        rows = con.execute(sql + " ORDER BY invalidated_at IS NOT NULL, source", par).fetchall()
+        for rid, s, t, tp, inv, mot in rows:
+            if inv:
+                print(f"{RED}⊘{RST} #{rid:<3} {s} -[{tp}]-> {t}  {DIM}(morta em {inv}: {mot}){RST}")
+            else:
+                fora = "" if tp in VOCAB_REL else f" {YEL}·fora do vocabulário{RST}"
+                print(f"  #{rid:<3} {s} -[{BOLD}{tp}{RST}]-> {t}{fora}")
+        print(f"\n{len(rows)} relation(s)")
+    finally:
+        con.close()
+
+
+def cmd_rel_audit(a):
+    exige_db(a.db)
+    con = conectar(a.db, ro=True)
+    try:
+        tot = con.execute("SELECT COUNT(*) FROM relations").fetchone()[0]
+        viv = con.execute("SELECT COUNT(*) FROM relations WHERE invalidated_at IS NULL").fetchone()[0]
+        obs = con.execute("SELECT COUNT(*) FROM observations WHERE cold=0").fetchone()[0]
+        print(f"{BOLD}relations{RST}: {tot} ({viv} vigentes, {tot - viv} invalidadas) · observations quentes: {obs}")
+        if obs:
+            print(f"densidade: {viv / obs:.3f} aresta vigente por fato\n")
+        dentro, fora = [], []
+        for t, n in con.execute("SELECT relation_type, COUNT(*) FROM relations WHERE invalidated_at IS NULL GROUP BY 1 ORDER BY 2 DESC"):
+            (dentro if t in VOCAB_REL else fora).append((t, n))
+        for t, n in dentro:
+            print(f"  {GRN}✓{RST} {t:<22} {n}")
+        if fora:
+            print(f"\n  {YEL}fora do vocabulário{RST} (decidir um a um; cuidado com direção invertida):")
+            for t, n in fora:
+                print(f"  · {t:<30} {n}")
+        print(f"\n{BOLD}bloqueios/dependências vigentes{RST} (revisar se ainda valem):")
+        for rid, s, t, vf in con.execute(
+                "SELECT id,source,target,valid_from FROM relations WHERE invalidated_at IS NULL "
+                "AND relation_type IN ('bloqueado por','depende de') ORDER BY valid_from"):
+            print(f"  #{rid:<3} {s} -> {t}  {DIM}desde {(vf or '?')[:10]}{RST}")
+    finally:
+        con.close()
+
+
+# ------------------------------------------------------------- contradições
+
+
+def pares_candidatos(fatos, dias=60, max_pares=40):
+    """Determinístico, sem LLM. Monta pares (antigo, novo) pro juiz.
+
+    Lição que custou caro: sobreposição de vocabulário mede MESMO ASSUNTO, não
+    contradição. "Decidiu sair" e "decidiu ficar" quase não compartilham palavra,
+    e é exatamente esse par que interessa. Então: marca FORTE de reversão tem
+    prioridade absoluta, a janela olha primeiro a PRÓPRIA entity por recência,
+    e fortes nunca são truncados pelo teto."""
+    corte = (date.today() - timedelta(days=dias)).isoformat()
+
+    def tokens(txt):
+        t = desacentua(txt.lower())
+        return {w for w in re.findall(r"[a-z0-9]{4,}", t)}
+
+    df = Counter()
+    vivos = [dict(f) for f in fatos if f["tipo"] in TIPOS_ESTADO]
+    ja_mortos = superseded_ids(fatos)
+    vivos = [f for f in vivos if f["id"] not in ja_mortos]
+    for f in vivos:
+        f["tok"] = tokens(f["texto"] + " " + f["entity"])
+        df.update(f["tok"])
+    n = max(len(vivos), 1)
+    novos = [f for f in vivos if f["ts"][:10] >= corte]
+    ents = {f["entity"] for f in vivos}
+
+    def peso(an, nv):
+        comuns = nv["tok"] & an["tok"]
+        return sum(1.0 / (1 + df[t] / n * 10) for t in comuns) if comuns else 0.0
+
+    fortes, resto = [], []
+    for nv in novos:
+        forca = forca_marca(nv["texto"])
+        if forca == 0:
+            continue
+        texto_nv = desacentua(nv["texto"].lower())
+        citadas = {e for e in ents if desacentua(e.lower()) in texto_nv}
+        mesmo = [an for an in vivos if an["id"] < nv["id"]
+                 and (an["entity"] == nv["entity"] or an["entity"] in citadas)]
+        if not mesmo:
+            continue
+        if forca == 2:
+            proprias = sorted([x for x in mesmo if x["entity"] == nv["entity"]], key=lambda x: -x["id"])[:6]
+            citas = sorted([x for x in mesmo if x["entity"] != nv["entity"]], key=lambda x: -x["id"])[:5]
+            topo = sorted(mesmo, key=lambda x: -peso(x, nv))[:3]
+            vistos, sel = set(), []
+            for an in proprias + citas + topo:
+                if an["id"] not in vistos:
+                    vistos.add(an["id"])
+                    sel.append(an)
+            fortes.extend((round(peso(an, nv), 2), an, nv) for an in sel)
+        else:
+            cands = sorted(((round(peso(an, nv), 2), an, nv) for an in mesmo if peso(an, nv) >= 1.5),
+                           key=lambda x: -x[0])[:3]
+            resto.extend(cands)
+    fortes.sort(key=lambda x: (-x[2]["id"], -x[0]))
+    sobra = max(0, max_pares - len(fortes))
+    return fortes + resto[:sobra]
+
+
+PROMPT_JUIZ = """Você julga pares de fatos de uma memória append-only, em português do Brasil.
+Para cada par: o fato NOVO invalida o ANTIGO? Invalida = o antigo DEIXOU DE SER VERDADE.
+NÃO invalida: tarefa concluída (isso é baixa), fatos que convivem, detalhe/continuação, outro objeto.
+Seja CONSERVADOR: supersede errado apaga memória boa em silêncio. Na dúvida, invalida=false.
+Responda SÓ com JSON: {"vereditos":[{"par":N,"invalida":bool,"confianca":0.0-1.0,"motivo":"frase curta"}]}
+PARES:
+"""
+
+
+def cmd_contradicoes(a):
+    exige_db(a.db)
+    fatos = carrega_fatos(a.db)
+    cand = pares_candidatos(fatos, a.dias, a.max_pares)
+    if not cand:
+        print("nenhum par candidato. Ou a memória está coerente, ou ninguém escreveu reversão ainda.")
+        return
+    vereditos = {}
+    if a.juiz != "off":
+        if not shutil.which("claude"):
+            print(f"{YEL}aviso{RST}: CLI `claude` não encontrado; caindo pro relatório determinístico.", file=sys.stderr)
+        else:
+            import json as _json
+            for i in range(0, len(cand), 6):
+                bloco = cand[i:i + 6]
+                partes = []
+                for j, (_s, an, nv) in enumerate(bloco, start=i + 1):
+                    partes.append(f"\n--- par {j} ---\n"
+                                  f"ANTIGO #{an['id']} [{an['ts']}] ({an['entity']} · {an['tipo']}): {an['texto'][:400]}\n"
+                                  f"NOVO   #{nv['id']} [{nv['ts']}] ({nv['entity']} · {nv['tipo']}): {nv['texto'][:400]}")
+                try:
+                    r = subprocess.run(["claude", "-p", PROMPT_JUIZ + "\n".join(partes), "--model", a.juiz],
+                                       capture_output=True, text=True, timeout=300)
+                    m = re.search(r"\{.*\}", r.stdout or "", re.S)
+                    if m:
+                        for v in _json.loads(m.group(0)).get("vereditos", []):
+                            vereditos[int(v["par"])] = v
+                except (subprocess.TimeoutExpired, ValueError, KeyError) as e:
+                    print(f"{YEL}aviso{RST}: juiz falhou num lote: {e}", file=sys.stderr)
+
+    print(f"# Contradições — propostas de supersede ({agora()})")
+    print(f"{DIM}Nada abaixo foi aplicado. A máquina propõe, o humano decide.{RST}\n")
+    achou = False
+    for j, (score, an, nv) in enumerate(cand, start=1):
+        v = vereditos.get(j)
+        if v and v.get("invalida") and float(v.get("confianca", 0)) >= a.confianca:
+            achou = True
+            print(f"{BOLD}#{an['id']} morto por #{nv['id']}{RST}  (confiança {v['confianca']})")
+            print(f"  antigo [{an['ts']}] {an['entity']}: {an['texto'][:180]}")
+            print(f"  novo   [{nv['ts']}] {nv['entity']}: {nv['texto'][:180]}")
+            print(f"  motivo: {v['motivo']}")
+            print(f'  {DIM}aplicar: saudade add "{an["entity"]}" supersede "#{an["id"]} · {v["motivo"][:120]}"{RST}\n')
+    if a.juiz == "off" or not vereditos:
+        print(f"{len(cand)} pares candidatos (determinístico). Rode com --juiz sonnet pra julgar, ou revise à mão:")
+        for j, (score, an, nv) in enumerate(cand[:15], start=1):
+            print(f"  #{an['id']} vs #{nv['id']}  {DIM}{nv['texto'][:90]}{RST}")
+    elif not achou:
+        print("nenhuma contradição com confiança suficiente.")
+
+
+# ------------------------------------------------------------- compactação
+
+
+def cmd_compactar(a):
+    """Aditivo. NUNCA apaga, NUNCA reescreve content: grava uma `sintese` e marca
+    as originais com cold=1. Comprimir destrutivamente perde informação (o
+    LongMemEval mede isso); aqui o log bruto fica inteiro."""
+    exige_db(a.db)
+    fatos = carrega_fatos(a.db)
+    mortos = superseded_ids(fatos)
+    baixas = resolved_ids(fatos, mortos)
+    corte = (date.today() - timedelta(days=a.dias)).isoformat()
+
+    alvo_de = set()
+    for f in fatos:
+        if f["tipo"] in TIPOS_ALVO:
+            alvo_de.update(leading_ids(f["texto"]))
+
+    por_ent = {}
+    for f in fatos:
+        if f["tipo"] in ("sintese", "decisao"):
+            continue
+        if f["ts"][:10] >= corte:
+            continue
+        encerrada = (f["id"] in mortos) or (f["id"] in baixas) or \
+                    (f["tipo"] in ("mudanca", "observacao", "experimento", "resolvido", "supersede") and f["id"] not in alvo_de)
+        if encerrada:
+            por_ent.setdefault(f["entity"], []).append(f)
+
+    plano = {e: fs for e, fs in por_ent.items() if len(fs) >= a.min_obs}
+    if not plano:
+        print(f"nenhuma entity candidata (--dias {a.dias} --min-obs {a.min_obs}). Nada a fazer.")
+        return
+    for e, fs in plano.items():
+        tipos = Counter(f["tipo"] for f in fs)
+        ids = [f["id"] for f in fs]
+        resumo = ", ".join(f"{n} {t}" for t, n in tipos.most_common())
+        print(f"{BOLD}{e}{RST}: {len(fs)} obs de {fs[0]['ts'][:10]} a {fs[-1]['ts'][:10]} ({resumo}) ids #{min(ids)}-#{max(ids)}")
+    if not a.apply:
+        print(f"\n{DIM}[dry-run] nada foi escrito. Rode com --apply pra aplicar.{RST}")
+        return
+    if not a.yes:
+        resp = input("aplicar? digite 'sim': ")
+        if resp.strip().lower() != "sim":
+            print("abortado.")
+            return
+    bk = f"{a.db}.bak-compact-{datetime.now().strftime('%Y%m%d-%H%M%S')}"
+    src = sqlite3.connect(a.db)
+    dst = sqlite3.connect(bk)
+    src.backup(dst)
+    dst.close()
+    src.close()
+    print(f"backup: {bk}")
+    con = conectar(a.db)
+    try:
+        for e, fs in plano.items():
+            tipos = Counter(f["tipo"] for f in fs)
+            ids = [f["id"] for f in fs]
+            resumo = ", ".join(f"{n} {t}" for t, n in tipos.most_common())
+            stamp = agora()
+            texto = (f"[compactação {stamp[:10]}] {len(fs)} obs de {fs[0]['ts'][:10]} a {fs[-1]['ts'][:10]} "
+                     f"esfriadas ({resumo}). Log bruto preservado, ids #{min(ids)}-#{max(ids)}")
+            con.execute("INSERT INTO observations (entity_name, content, tipo, ts) VALUES (?,?,?,?)",
+                        (e, f"[{stamp}] sintese :: {texto}", "sintese", stamp))
+            con.executemany("UPDATE observations SET cold=1 WHERE id=?", [(i,) for i in ids])
+        con.commit()
+    finally:
+        con.close()
+    print(f"{GRN}ok{RST}: sínteses gravadas, originais esfriadas. Nada apagado.")
+
+
+# ----------------------------------------------------------------------- main
+
+
+def main(argv=None):
+    p = argparse.ArgumentParser(prog="saudade", description="memória que sabe o que morreu")
+    p.add_argument("--db", default=DB, help=f"caminho do banco (padrão: $SAUDADE_DB ou {DB})")
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    sub.add_parser("init", help="cria o banco").set_defaults(fn=cmd_init)
+
+    pa = sub.add_parser("add", help="grava um fato (append-only)")
+    pa.add_argument("entity")
+    pa.add_argument("tipo")
+    pa.add_argument("texto")
+    pa.add_argument("--type", dest="etype", default="tema")
+    pa.add_argument("--at", help="timestamp 'YYYY-MM-DD HH:MM' (padrão: agora)")
+    pa.add_argument("--force", action="store_true")
+    pa.set_defaults(fn=cmd_add)
+
+    pl = sub.add_parser("lint", help="higiene do fato antes de gravar")
+    pl.add_argument("tipo")
+    pl.add_argument("texto")
+    pl.set_defaults(fn=cmd_lint)
+
+    pb = sub.add_parser("buscar", help="busca full-text (BM25) com consciência de estado")
+    pb.add_argument("termo")
+    pb.add_argument("--tipo")
+    pb.add_argument("--entity")
+    pb.add_argument("--vigente", action="store_true", help="esconde superados e resolvidos")
+    pb.add_argument("--incluir-frios", action="store_true")
+    pb.add_argument("--limit", type=int, default=8)
+    pb.set_defaults(fn=cmd_buscar)
+
+    pe = sub.add_parser("estado", help="a projeção: o que vale agora")
+    pe.add_argument("--dias-pendencia", type=int, default=30)
+    pe.add_argument("--dias-decisao", type=int, default=7)
+    pe.set_defaults(fn=cmd_estado)
+
+    pr = sub.add_parser("rel", help="conexões entre entities, com validade")
+    rsub = pr.add_subparsers(dest="relcmd", required=True)
+    r1 = rsub.add_parser("add")
+    r1.add_argument("source")
+    r1.add_argument("target")
+    r1.add_argument("tipo")
+    r1.add_argument("--force", action="store_true")
+    r1.set_defaults(fn=cmd_rel_add)
+    r2 = rsub.add_parser("invalidate")
+    r2.add_argument("id", type=int)
+    r2.add_argument("--reason", required=True)
+    r2.add_argument("--by", default="humano")
+    r2.set_defaults(fn=cmd_rel_invalidate)
+    r3 = rsub.add_parser("list")
+    r3.add_argument("--entity")
+    r3.add_argument("--todas", action="store_true")
+    r3.set_defaults(fn=cmd_rel_list)
+    rsub.add_parser("audit").set_defaults(fn=cmd_rel_audit)
+
+    pc = sub.add_parser("contradicoes", help="propõe supersedes; NUNCA aplica")
+    pc.add_argument("--dias", type=int, default=60)
+    pc.add_argument("--max-pares", type=int, default=40)
+    pc.add_argument("--confianca", type=float, default=0.7)
+    pc.add_argument("--juiz", default="off", help="'off' (determinístico) ou modelo do CLI claude (ex: sonnet)")
+    pc.set_defaults(fn=cmd_contradicoes)
+
+    pk = sub.add_parser("compactar", help="esfria threads fechadas; aditivo, nunca apaga")
+    pk.add_argument("--dias", type=int, default=90)
+    pk.add_argument("--min-obs", type=int, default=8)
+    pk.add_argument("--apply", action="store_true")
+    pk.add_argument("--yes", action="store_true")
+    pk.set_defaults(fn=cmd_compactar)
+
+    a = p.parse_args(argv)
+    a.fn(a)
+
+
+if __name__ == "__main__":
+    main()
