@@ -75,3 +75,25 @@ Rode `python3 validar.py` depois de qualquer edição. Ele checa: 72 linhas,
 JSON válido, distribuição de rótulos, ids únicos e sequenciais,
 `rotulo_humano` sempre `null`, nenhum texto duplicado, e uma heurística de
 diversidade de vocabulário nos pares `contradiz`.
+
+
+## Como anotar (a ferramenta já vem junto)
+
+```bash
+python3 dataset/anotar.py seunome     # abre a tela no navegador (localhost:7864)
+```
+
+Um par por vez, cego (a tela nunca mostra o palpite da máquina), atalhos 1/2/3,
+`u` desfaz, pode parar e voltar quando quiser. Cada anotador roda com o próprio
+nome; a ordem dos pares é embaralhada por pessoa. Anote SEM conversar durante;
+a conversa é só na adjudicação dos conflitos.
+
+Depois de todos terminarem:
+
+```bash
+python3 dataset/anotar.py --kappa        # concordância entre anotadores
+python3 dataset/anotar.py --consolidar   # grava o consenso em rotulo_humano
+```
+
+Conflito não se resolve por voto da máquina nem por pressa: os anotadores
+conversam par a par (adjudicação) e a decisão entra à mão.
