@@ -40,8 +40,8 @@ Se você parar de ler aqui e for aplicar as três num arquivo de texto, o repo j
 ## Veja rodando
 
 ```console
-$ saudade add "Cliente ACME" decisao "proposta fechada em 18.700/mês"
-+ #41  [2026-07-02 12:07] decisao :: proposta fechada em 18.700/mês
+$ saudade add "Cliente ACME" decisao "proposta fechada em 7.350/mês"
++ #41  [2026-07-02 12:07] decisao :: proposta fechada em 7.350/mês
 
 $ saudade add "Cliente ACME" supersede "#41 · cliente voltou atrás, renegociando do zero"
 + #58  [2026-07-09 09:14] supersede :: #41 · cliente voltou atrás, renegociando do zero
@@ -49,7 +49,7 @@ $ saudade add "Cliente ACME" supersede "#41 · cliente voltou atrás, renegocian
 
 $ saudade buscar "proposta ACME"
 #41  Cliente ACME  decisao  2026-07-02 12:07  ⊘ SUPERADO
-  proposta fechada em 18.700/mês
+  proposta fechada em 7.350/mês
   ⊘ morto por #58: cliente voltou atrás, renegociando do zero
 
 $ saudade buscar "proposta ACME" --vigente
