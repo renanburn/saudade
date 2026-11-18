@@ -122,6 +122,7 @@ A especificação completa, sem uma linha de código, está em [`ESPECIFICACAO.m
 | [gororoba](https://github.com/renanburn/gororoba) | a IA escreve com a **sua** voz |
 | [tempero](https://github.com/renanburn/tempero) | **você** monta a sua régua |
 | [sobrinho](https://github.com/renanburn/sobrinho) | a IA desenha com a **sua** marca |
+| [marmita](https://github.com/renanburn/marmita) | a IA gasta **menos** token sem ficar mais burra |
 | **saudade** | a IA lembra o que **foi** verdade, e quando deixou de ser |
 
 ## O que a saudade NÃO faz (e é escolha, não falta)
