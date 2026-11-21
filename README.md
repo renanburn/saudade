@@ -35,7 +35,7 @@ A saudade faz as duas coisas ao mesmo tempo: **nunca apaga, e sabe o que morreu*
 2. **Nunca apague. Marque o que morreu, dizendo por quê.**
 3. **A IA lê a projeção, não o log.** O log guarda tudo; a projeção mostra o que vale agora.
 
-Se você parar de ler aqui e for aplicar as três num arquivo de texto, o repo já cumpriu o papel. Tem um guia inteiro disso em [`docs/sem-codigo.md`](docs/sem-codigo.md).
+Se você parar de ler aqui e for aplicar as três num arquivo de texto, o repo já cumpriu o papel. Tem um guia inteiro disso em [`docs/sem-codigo.md`](docs/sem-codigo.md). As notas prontas pra copiar estão em [`modelos/`](modelos/).
 
 ## Veja rodando
 

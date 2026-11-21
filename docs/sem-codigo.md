@@ -11,6 +11,9 @@ instalar nada:
 Se você não quer rodar Python, abre uma nota no Obsidian e segue este guia.
 Funciona igual. Migra pro banco depois, se e quando fizer sentido.
 
+Quer começar por arquivos prontos? Em [`modelos/`](../modelos/) tem três notas
+pra copiar: quem sou eu, projetos e caderneta de decisões.
+
 ## O arquivo
 
 Cria uma nota, `caderneta.md`. Cada linha é um fato, neste formato:
